@@ -2,8 +2,8 @@ name: CIDR Cloudflare Best IP Scan & Latency Test
 
 on:
   schedule:
-    # UTC 02:00 运行（北京时间 10:00），可按需调整
-    - cron: ""
+    # UTC 02:00 运行（北京时间 10:00），如不需要定时执行可注释掉这两行
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       ports:
@@ -39,50 +39,50 @@ jobs:
           fi
 
           rm -rf /tmp/cf_scan && mkdir -p /tmp/cf_scan
-          SAMPLE_PER_CIDR="${{ github.event.inputs.sample_per_cidr || '64' }}"
+          export SAMPLE_PER_CIDR="${{ github.event.inputs.sample_per_cidr || '64' }}"
 
           python3 - <<'PY'
-import ipaddress, os, random, sys
+          import ipaddress, os, random, sys
 
-sample_limit = int(os.environ.get("SAMPLE_PER_CIDR", "64"))
-seen = set()
-out_ips = []
+          sample_limit = int(os.environ.get("SAMPLE_PER_CIDR", "64"))
+          seen = set()
+          out_ips = []
 
-with open("网段.txt", "r", encoding="utf-8", errors="ignore") as f:
-    for raw in f:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # 兼容误带端口的写法（如 1.2.3.0/24:443 -> 1.2.3.0/24）
-        if "/" not in line and ":" in line:
-            line = line.split(":", 1)[0].strip()
-        try:
-            net = ipaddress.ip_network(line, strict=False)
-        except ValueError:
-            print(f"警告：跳过无效网段 -> {line}", file=sys.stderr)
-            continue
+          with open("网段.txt", "r", encoding="utf-8", errors="ignore") as f:
+              for raw in f:
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  # 兼容误带端口的写法（如 1.2.3.0/24:443 -> 1.2.3.0/24）
+                  if "/" not in line and ":" in line:
+                      line = line.split(":", 1)[0].strip()
+                  try:
+                      net = ipaddress.ip_network(line, strict=False)
+                  except ValueError:
+                      print(f"警告：跳过无效网段 -> {line}", file=sys.stderr)
+                      continue
 
-        if net.num_addresses == 1:
-            hosts = [str(net.network_address)]
-        else:
-            hosts = [str(ip) for ip in net.hosts()]
+                  if net.num_addresses == 1:
+                      hosts = [str(net.network_address)]
+                  else:
+                      hosts = [str(ip) for ip in net.hosts()]
 
-        if sample_limit > 0 and len(hosts) > sample_limit:
-            hosts = random.sample(hosts, sample_limit)
+                  if sample_limit > 0 and len(hosts) > sample_limit:
+                      hosts = random.sample(hosts, sample_limit)
 
-        for h in hosts:
-            if h not in seen:
-                seen.add(h)
-                out_ips.append(h)
+                  for h in hosts:
+                      if h not in seen:
+                          seen.add(h)
+                          out_ips.append(h)
 
-with open("/tmp/cf_scan/candidates.txt", "w", encoding="utf-8") as f:
-    for ip in out_ips:
-        f.write(ip + "\n")
+          with open("/tmp/cf_scan/candidates.txt", "w", encoding="utf-8") as f:
+              for ip in out_ips:
+                  f.write(ip + "\n")
 
-print(f"网段拆分完成，共生成候选 IP 数量: {len(out_ips)}")
-if not out_ips:
-    sys.exit(1)
-PY
+          print(f"网段拆分完成，共生成候选 IP 数量: {len(out_ips)}")
+          if not out_ips:
+              sys.exit(1)
+          PY
 
       - name: Download and extract CloudflareSpeedTest
         run: |
