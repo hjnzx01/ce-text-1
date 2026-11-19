@@ -1,4 +1,1 @@
 IP,Port,IP_Port,AvgLatency_ms,CF_Signal
-45.32.64.173,443,45.32.64.173:443,37.66,"server: cloudflare;cf-ray: a5d1f9e1fde2cb9a-LAX"
-45.32.12.16,443,45.32.12.16:443,132.97,"server: cloudflare;cf-ray: a5d1f9f22c3de373-NRT"
-45.32.12.91,443,45.32.12.91:443,133.07,"server: cloudflare;cf-ray: a5d1f9f4d9253ea4-NRT"
