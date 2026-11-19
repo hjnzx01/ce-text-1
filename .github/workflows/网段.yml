@@ -3,13 +3,17 @@ name: CIDR Cloudflare Best IP Scan & Latency Test
 on:
   schedule:
     # UTC 02:00 运行（北京时间 10:00），如不需要定时执行可注释掉这两行
-    - cron: "0 2 * * *"
+    - cron: ""
   workflow_dispatch:
     inputs:
       ports:
         description: "测速端口列表（逗号分隔，默认 443，支持如 443,8443,9443,80）"
         required: false
         default: "443"
+      min_latency_ms:
+        description: "最小延迟阈值（ms，默认 25）：平均延迟低于该值的 IP:端口 不做 Cloudflare 验证，也不会出现在结果里；填 0 表示不设下限"
+        required: false
+        default: "25"
       max_latency_ms:
         description: "最大延迟阈值（ms，默认 350）"
         required: false
@@ -115,6 +119,8 @@ jobs:
       - name: Latency test & Cloudflare edge verification per port
         env:
           PORTS_RAW: ${{ github.event.inputs.ports || '443' }}
+          # 这里不用 || 兜底，避免用户填 0（不设下限）被当成空值；空值在脚本里回落到 25
+          MIN_LATENCY_RAW: ${{ github.event.inputs.min_latency_ms }}
           MAX_LATENCY: ${{ github.event.inputs.max_latency_ms || '350' }}
           # 每个端口只对延迟最低的前 N 个 IP 做 CF 特征验证
           VERIFY_TOP: "50"
@@ -125,8 +131,12 @@ jobs:
           PORTS_CLEAN=$(echo "${PORTS_RAW}" | tr -d '[:space:]')
           [ -z "${PORTS_CLEAN}" ] && PORTS_CLEAN="443"
 
+          # 最小延迟：未填（如定时触发）时默认 25ms；填 0 表示不设下限
+          MIN_LATENCY=$(echo "${MIN_LATENCY_RAW}" | tr -d '[:space:]')
+          [ -z "${MIN_LATENCY}" ] && MIN_LATENCY="25"
+
           echo "候选 IP 数量: $(wc -l < /tmp/cf_scan/candidates.txt)"
-          echo "将要测试的端口列表: ${PORTS_CLEAN} | 延迟上限: ${MAX_LATENCY}ms"
+          echo "将要测试的端口列表: ${PORTS_CLEAN} | 进入 CF 验证的延迟范围: ${MIN_LATENCY}ms ~ ${MAX_LATENCY}ms"
           : > /tmp/cf_scan/verified_cf_ips.txt
           : > /tmp/cf_scan/verified_ip_ports.txt
           echo "IP,Port,IP_Port,AvgLatency_ms,CF_Signal" > /tmp/cf_scan/verified_details.csv
@@ -138,14 +148,22 @@ jobs:
           scheme="https"; [ "${port}" = "80" ] && scheme="http"
           pat='cf-ray|server:[[:space:]]*cloudflare'
 
-          headers=$(curl -k -sS -I --connect-timeout 3 --max-time 5 \
-            --resolve "www.cloudflare.com:${port}:${ip}" \
-            "${scheme}://www.cloudflare.com:${port}/cdn-cgi/trace" 2>/dev/null || true)
+          # IPv6 地址在 URL / --resolve 中需要加方括号
+          host_ip="${ip}"; [[ "${ip}" == *:* ]] && host_ip="[${ip}]"
 
-          # 带域名探测没拿到特征时，再直接向 IP 发请求
+          # curl 返回码 7=连接失败、28=超时：视为超时，直接剔除，不再做第二次探测，节省时间
+          headers=$(curl -k -sS -I --connect-timeout 2 --max-time 4 \
+            --resolve "www.cloudflare.com:${port}:${host_ip}" \
+            "${scheme}://www.cloudflare.com:${port}/cdn-cgi/trace" 2>/dev/null) && rc=0 || rc=$?
+          if [ "${rc}" = "7" ] || [ "${rc}" = "28" ]; then
+            echo "[剔除-验证超时/连接失败] ${ip}:${port} | 延迟: ${avg}ms" >&2
+            exit 0
+          fi
+
+          # 带域名探测没拿到特征（但连接是通的）时，再直接向 IP 发请求
           if ! echo "${headers}" | grep -qiE "${pat}"; then
-            headers=$(curl -k -sS -I --connect-timeout 3 --max-time 5 \
-              "${scheme}://${ip}:${port}/cdn-cgi/trace" 2>/dev/null || true)
+            headers=$(curl -k -sS -I --connect-timeout 2 --max-time 4 \
+              "${scheme}://${host_ip}:${port}/cdn-cgi/trace" 2>/dev/null || true)
           fi
 
           if echo "${headers}" | grep -qiE "${pat}"; then
@@ -170,7 +188,7 @@ jobs:
 
             echo "================ 端口 ${port} 延迟测速中 ================"
             # -dd: 禁用下载测速，仅做延迟与丢包测速
-            # -n 500: 延迟测速并发数（默认 200，最大 1000）
+            # -n 500: 延迟测速并发数（默认 250，最大 1000）
             (
               cd /tmp/cf_scan/cfst_linux_amd64
               timeout "${CFST_TIMEOUT}" ./cfst \
@@ -184,10 +202,20 @@ jobs:
 
             [ -s "${out_csv}" ] || continue
 
-            echo "---- 端口 ${port}：验证延迟最低的前 ${VERIFY_TOP} 个 IP ----"
-            # CSV 第一行是表头（中文，不是 "IP Address"），用 tail 跳过；cfst 结果已按延迟升序
-            tail -n +2 "${out_csv}" | head -n "${VERIFY_TOP}" \
-              | awk -F',' -v p="${port}" 'NF>=5 && $1!="" {print $1, p, $5}' \
+            # CSV 第一行是中文表头（用 NR>1 跳过）；列：1=IP 2=已发送 3=已接收 4=丢包率 5=平均延迟(ms)
+            # 只有同时满足「已接收>0」「延迟>0」「MIN_LATENCY <= 延迟 <= MAX_LATENCY」的 IP:端口 才会进入 CF 验证；
+            # 无响应/超时、延迟低于下限、延迟超上限的一律跳过（也不会进入结果）。cfst 结果已按延迟升序。
+            elig="/tmp/cf_scan/eligible_${port}.txt"
+            awk -F',' -v p="${port}" -v min="${MIN_LATENCY}" -v max="${MAX_LATENCY}" '
+              NR > 1 && NF >= 5 && $1 != "" && ($3 + 0) > 0 && ($5 + 0) > 0 &&
+              ($5 + 0) >= (min + 0) && ($5 + 0) <= (max + 0) { print $1, p, $5 }' \
+              "${out_csv}" > "${elig}"
+
+            total_rows=$(( $(wc -l < "${out_csv}") - 1 ))
+            elig_rows=$(wc -l < "${elig}")
+            echo "端口 ${port}：cfst 返回 ${total_rows} 条；延迟<${MIN_LATENCY}ms / 超时无响应 / 超上限共 $(( total_rows - elig_rows )) 条不做 CF 验证；待验证 ${elig_rows} 条，取延迟最低的前 ${VERIFY_TOP} 条"
+
+            head -n "${VERIFY_TOP}" "${elig}" \
               | xargs -P 10 -L 1 bash /tmp/cf_scan/verify.sh > "${res_csv}" || true
 
             if [ -s "${res_csv}" ]; then
