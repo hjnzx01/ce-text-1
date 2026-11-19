@@ -1,0 +1,99 @@
+name: Custom Source IP Download Speedtest
+
+on:
+  schedule:
+    # UTC 01:00 运行（北京时间 09:00），可按需修改
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  download-speedtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check and normalize 来源.txt
+        run: |
+          if [ ! -f "来源.txt" ]; then
+            echo "错误：仓库根目录下未找到 来源.txt"
+            exit 1
+          fi
+
+          mkdir -p /tmp/cfst
+          # 去除 \r、前后空白、空行与 # 注释；若未写端口则默认补全 :443，再去重
+          awk '
+            {
+              gsub(/\r$/, "")
+              sub(/^[[:space:]]+|[[:space:]]+$/, "")
+              if ($0 == "" || $0 ~ /^#/) next
+              if ($0 !~ /:[0-9]+$/) {
+                $0 = $0 ":443"
+              }
+              if (!seen[$0]++) print $0
+            }
+          ' "来源.txt" > /tmp/cfst/targets.txt
+
+          TARGET_COUNT=$(wc -l < /tmp/cfst/targets.txt)
+          echo "有效测速目标数量: ${TARGET_COUNT}"
+          if [ "${TARGET_COUNT}" -eq 0 ]; then
+            echo "错误：来源.txt 中没有可用 IP 目标"
+            exit 1
+          fi
+
+      - name: Download and extract CloudflareSpeedTest
+        run: |
+          curl -fsSL -o /tmp/cfst/cfst.tar.gz \
+            "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_amd64.tar.gz"
+          tar -zxf /tmp/cfst/cfst.tar.gz -C /tmp/cfst
+          chmod +x /tmp/cfst/cfst
+
+      - name: Run download speedtest against custom targets
+        run: |
+          cd /tmp/cfst
+          # -f targets.txt: 使用 来源.txt 整理出的自定义 IP/端口列表
+          # -tp: 指定测速端口（当目标含端口时优先按目标端口连接；若全为同端口也可显式指定）
+          # -tl 400: 延迟上限 400ms
+          # -dt 8: 每个 IP 下载测速时长（秒），建议 5~10 秒以测出稳定下载速度
+          # -dn 20: 保留前 20 个满足条件的 IP
+          # -url: 建议替换为稳定且命中 Cloudflare 的大文件测速地址
+          SPEEDTEST_URL="${SPEEDTEST_URL:-https://speed.cloudflare.com/__down?bytes=200000000}"
+
+          ./cfst \
+            -f /tmp/cfst/targets.txt \
+            -tl 400 \
+            -dt 8 \
+            -dn 20 \
+            -url "${SPEEDTEST_URL}" \
+            -o /tmp/cfst/result.csv
+
+      - name: Parse download speed results
+        run: |
+          mkdir -p output
+          cp /tmp/cfst/result.csv output/result.csv
+
+          echo "=== 测速明细（IP, 延迟, 下载速度 MB/s） ==="
+          awk -F',' 'NR>1 {printf "%s | 延迟:%s | 下载速度:%s MB/s\n", $1, $5, $6}' /tmp/cfst/result.csv
+
+          # 提取下载速度大于 0 的 IP（第 1 列为 IP，第 6 列通常为下载速度 MB/s；若含端口可按需拼接）
+          awk -F',' 'NR>1 && $1!="" && ($6+0)>0 {print $1}' /tmp/cfst/result.csv \
+            | awk '!seen[$0]++' > output/best_ips.txt
+
+          echo "有效下载速度 > 0 的 IP 数量: $(wc -l < output/best_ips.txt)"
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/best_ips.txt output/result.csv
+          if git diff --staged --quiet; then
+            echo "测速结果无变化，跳过提交。"
+          else
+            git commit -m "chore: speedtest custom IPs from 来源.txt ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
