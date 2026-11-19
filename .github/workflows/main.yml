@@ -3,7 +3,7 @@ name: Custom Source IP Download Speedtest
 on:
   schedule:
     # UTC 01:00 运行（北京时间 09:00），可按需修改
-    - cron: "0 1 * * *"
+    - cron: ""
   workflow_dispatch:
 
 permissions:
