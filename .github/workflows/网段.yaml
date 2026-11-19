@@ -1,0 +1,193 @@
+name: CIDR Cloudflare Best IP Scan & Latency Test
+
+on:
+  schedule:
+    # UTC 02:00 运行（北京时间 10:00），可按需调整
+    - cron: ""
+  workflow_dispatch:
+    inputs:
+      ports:
+        description: "测速端口列表（逗号分隔，默认 443，支持如 443,8443,9443,80）"
+        required: false
+        default: "443"
+      max_latency_ms:
+        description: "最大延迟阈值（ms，默认 350）"
+        required: false
+        default: "350"
+      sample_per_cidr:
+        description: "每个网段最多抽样 IP 数（0 表示全量展开，建议 32~128 防止超时）"
+        required: false
+        default: "64"
+
+permissions:
+  contents: write
+
+jobs:
+  scan-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Expand 网段.txt into candidate IPs
+        run: |
+          if [ ! -f "网段.txt" ]; then
+            echo "错误：仓库根目录下未找到 网段.txt"
+            exit 1
+          fi
+
+          rm -rf /tmp/cf_scan && mkdir -p /tmp/cf_scan
+          SAMPLE_PER_CIDR="${{ github.event.inputs.sample_per_cidr || '64' }}"
+
+          python3 - <<'PY'
+import ipaddress, os, random, sys
+
+sample_limit = int(os.environ.get("SAMPLE_PER_CIDR", "64"))
+seen = set()
+out_ips = []
+
+with open("网段.txt", "r", encoding="utf-8", errors="ignore") as f:
+    for raw in f:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # 兼容误带端口的写法（如 1.2.3.0/24:443 -> 1.2.3.0/24）
+        if "/" not in line and ":" in line:
+            line = line.split(":", 1)[0].strip()
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            print(f"警告：跳过无效网段 -> {line}", file=sys.stderr)
+            continue
+
+        if net.num_addresses == 1:
+            hosts = [str(net.network_address)]
+        else:
+            hosts = [str(ip) for ip in net.hosts()]
+
+        if sample_limit > 0 and len(hosts) > sample_limit:
+            hosts = random.sample(hosts, sample_limit)
+
+        for h in hosts:
+            if h not in seen:
+                seen.add(h)
+                out_ips.append(h)
+
+with open("/tmp/cf_scan/candidates.txt", "w", encoding="utf-8") as f:
+    for ip in out_ips:
+        f.write(ip + "\n")
+
+print(f"网段拆分完成，共生成候选 IP 数量: {len(out_ips)}")
+if not out_ips:
+    sys.exit(1)
+PY
+
+      - name: Download and extract CloudflareSpeedTest
+        run: |
+          curl -fsSL -o /tmp/cf_scan/cfst.tar.gz \
+            "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_amd64.tar.gz"
+          tar -zxf /tmp/cf_scan/cfst.tar.gz -C /tmp/cf_scan
+          chmod +x /tmp/cf_scan/cfst_linux_amd64/cfst
+
+      - name: Latency test & Cloudflare edge verification per port
+        run: |
+          PORTS_RAW="${{ github.event.inputs.ports || '443' }}"
+          MAX_LATENCY="${{ github.event.inputs.max_latency_ms || '350' }}"
+          # 清洗端口字符串，默认 443
+          PORTS_CLEAN=$(echo "${PORTS_RAW}" | tr -d '[:space:]')
+          [ -z "${PORTS_CLEAN}" ] && PORTS_CLEAN="443"
+
+          echo "将要测试的端口列表: ${PORTS_CLEAN} | 延迟上限: ${MAX_LATENCY}ms"
+          : > /tmp/cf_scan/verified_cf_ips.txt
+          : > /tmp/cf_scan/verified_ip_ports.txt
+          : > /tmp/cf_scan/verified_details.csv
+          echo "IP,Port,IP_Port,AvgLatency_ms,CF_Signal" > /tmp/cf_scan/verified_details.csv
+
+          IFS=',' read -ra PORT_ARR <<< "${PORTS_CLEAN}"
+          for port in "${PORT_ARR[@]}"; do
+            if ! [[ "${port}" =~ ^[0-9]+$ ]] || [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ]; then
+              echo "警告：跳过无效端口 ${port}"
+              continue
+            fi
+
+            out_csv="/tmp/cf_scan/result_${port}.csv"
+            echo "================ 端口 ${port} 延迟测速中 ================"
+            # -dd: 禁用下载测速，仅做延迟与丢包测速，更快且不受下载测速文件影响
+            (
+              cd /tmp/cf_scan/cfst_linux_amd64
+              ./cfst \
+                -f /tmp/cf_scan/candidates.txt \
+                -tp "${port}" \
+                -tl "${MAX_LATENCY}" \
+                -dd \
+                -dn 50 \
+                -o "${out_csv}"
+            ) || echo "端口 ${port} cfst 测速返回非零状态，继续下一端口"
+
+            [ -s "${out_csv}" ] || continue
+
+            # 遍历延迟通过的候选 IP，逐个探测是否返回 Cloudflare 特征（cf-ray / server: cloudflare）
+            while IFS=',' read -r ip _sent _recv _loss avg_ms _rest; do
+              [ "${ip}" = "IP Address" ] && continue
+              [ -z "${ip}" ] && continue
+
+              if [ "${port}" = "80" ]; then
+                scheme="http"
+              else
+                scheme="https"
+              fi
+
+              # 发起轻量 HEAD/GET 探测，读取响应头判断 Cloudflare 特征
+              headers=$(curl -k -sS -I --connect-timeout 3 --max-time 5 \
+                --resolve "www.cloudflare.com:${port}:${ip}" \
+                "${scheme}://www.cloudflare.com:${port}/cdn-cgi/trace" 2>/dev/null || true)
+
+              # 若带域名探测未拿到头，再尝试直接向 IP 发请求（部分节点仅响应默认 Host 或 403/400 但带 cf-ray）
+              if ! echo "${headers}" | grep -qiE "cf-ray|server:\s*cloudflare"; then
+                headers=$(curl -k -sS -I --connect-timeout 3 --max-time 5 \
+                  "${scheme}://${ip}:${port}/cdn-cgi/trace" 2>/dev/null || true)
+              fi
+
+              if echo "${headers}" | grep -qiE "cf-ray|server:\s*cloudflare"; then
+                signal=$(echo "${headers}" | tr -d '\r' | grep -iE "^(cf-ray|server):" | tr '\n' ';' | sed 's/;$//')
+                echo "[通过] ${ip}:${port} | 延迟: ${avg_ms}ms | ${signal}"
+                echo "${ip}" >> /tmp/cf_scan/verified_cf_ips.txt
+                echo "${ip}:${port}" >> /tmp/cf_scan/verified_ip_ports.txt
+                echo "${ip},${port},${ip}:${port},${avg_ms},\"${signal}\"" >> /tmp/cf_scan/verified_details.csv
+              else
+                echo "[剔除-非CF或无特征] ${ip}:${port} | 延迟: ${avg_ms}ms"
+              fi
+            done < "${out_csv}"
+          done
+
+      - name: Save filtered Cloudflare best IPs
+        run: |
+          mkdir -p output
+          if [ -s /tmp/cf_scan/verified_cf_ips.txt ]; then
+            awk '!seen[$0]++' /tmp/cf_scan/verified_cf_ips.txt > output/best_ips.txt
+            awk '!seen[$0]++' /tmp/cf_scan/verified_ip_ports.txt > output/best_ip_ports.txt
+          else
+            : > output/best_ips.txt
+            : > output/best_ip_ports.txt
+          fi
+          cp /tmp/cf_scan/verified_details.csv output/cf_verified.csv
+
+          echo "=== 符合条件的 Cloudflare 优选 IP（纯 IP） ==="
+          cat output/best_ips.txt
+          echo "=== 符合条件的 Cloudflare 优选 IP:端口 ==="
+          cat output/best_ip_ports.txt
+          echo "总计通过 IP 数: $(wc -l < output/best_ips.txt)"
+
+      - name: Commit and push results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/best_ips.txt output/best_ip_ports.txt output/cf_verified.csv
+          if git diff --staged --quiet; then
+            echo "测速结果无变化，跳过提交。"
+          else
+            git commit -m "chore: scan CIDR & filter Cloudflare best IPs ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
