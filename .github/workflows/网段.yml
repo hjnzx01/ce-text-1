@@ -3,7 +3,7 @@ name: CIDR Cloudflare Best IP Scan & Latency Test
 on:
   schedule:
     # UTC 02:00 运行（北京时间 10:00），如不需要定时执行可注释掉这两行
-    - cron: ""
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       ports:
