@@ -18,10 +18,6 @@ on:
         description: "最大延迟阈值（ms，默认 350）"
         required: false
         default: "350"
-      max_candidates:
-        description: "单个端口最多测速的 IP 数上限（默认 30000）。cfst 对每个 /24 随机抽 1 个 IP 测速，估算数超过上限时会随机丢弃部分网段。留空或填 0 = 使用默认值（不支持不限制，否则必然超时）"
-        required: false
-        default: "30000"
 
 permissions:
   contents: write
@@ -35,10 +31,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Normalize 网段.txt (keep CIDRs, do NOT expand to IPs)
-        env:
-          # 这里不用 || 兜底，空值/0/非数字统一在脚本里回落到默认值
-          MAX_CANDIDATES_RAW: ${{ github.event.inputs.max_candidates }}
+      - name: Expand 网段.txt to all individual IPs
         run: |
           if [ ! -f "网段.txt" ]; then
             echo "错误：仓库根目录下未找到 网段.txt"
@@ -48,23 +41,9 @@ jobs:
           rm -rf /tmp/cf_scan && mkdir -p /tmp/cf_scan
 
           python3 - <<'PY'
-          import ipaddress, os, random, re, sys
+          import ipaddress, re, sys
 
-          try:
-              cap = int((os.environ.get("MAX_CANDIDATES_RAW") or "").strip())
-          except ValueError:
-              cap = 0
-          if cap <= 0:
-              cap = 30000
-
-          def probes(net):
-              # 粗略估算 cfst 会对该网段测速多少个 IP：
-              # IPv4 每个 /24 随机抽 1 个（比 /24 小的网段算 1 个）；IPv6 粗略按 1 个算
-              if net.version == 4 and net.prefixlen < 24:
-                  return 1 << (24 - net.prefixlen)
-              return 1
-
-          nets, seen = [], set()
+          nets, seen_nets = [], set()
           with open("网段.txt", "r", encoding="utf-8-sig", errors="ignore") as f:
               for raw in f:
                   line = raw.split("#", 1)[0].strip()
@@ -79,36 +58,28 @@ jobs:
                   except ValueError:
                       print(f"警告：跳过无效网段 -> {line}", file=sys.stderr)
                       continue
-                  if net in seen:
+                  if net in seen_nets:
                       continue
-                  seen.add(net)
+                  seen_nets.add(net)
                   nets.append(net)
 
           if not nets:
               print("错误：网段.txt 中没有有效网段")
               sys.exit(1)
 
-          est_all = sum(probes(n) for n in nets)
-          random.shuffle(nets)
-          kept, est_kept = [], 0
-          for n in nets:
-              p = probes(n)
-              if est_kept + p <= cap:
-                  kept.append(n)
-                  est_kept += p
+          total_ips = 0
+          with open("/tmp/cf_scan/all_ips.txt", "w", encoding="utf-8") as out:
+              for net in nets:
+                  # 单个 IP（如 /32 或 /128）直接写入；网段展开全部包含的 IP（含网络地址和广播地址，不遗漏）
+                  if net.num_addresses == 1:
+                      out.write(str(net.network_address) + "\n")
+                      total_ips += 1
+                  else:
+                      for ip in net:
+                          out.write(str(ip) + "\n")
+                          total_ips += 1
 
-          print(f"有效网段 {len(nets)} 个，估算 cfst 单端口需测速约 {est_all} 个 IP")
-          if len(kept) < len(nets):
-              print(f"超过上限 {cap}：随机保留 {len(kept)} 个网段（约 {est_kept} 个 IP），丢弃 {len(nets) - len(kept)} 个网段")
-          if not kept:
-              print("错误：所有网段都超过上限，请调大 max_candidates")
-              sys.exit(1)
-
-          # 只写 CIDR，交给 cfst 原生抽样；绝对不要在这里展开成逐个 IP
-          with open("/tmp/cf_scan/cidrs.txt", "w", encoding="utf-8") as f:
-              for n in kept:
-                  f.write(str(n) + "\n")
-          print(f"已写入 /tmp/cf_scan/cidrs.txt：{len(kept)} 个网段")
+          print(f"有效网段 {len(nets)} 个，已全量展开并写入 /tmp/cf_scan/all_ips.txt：共 {total_ips} 个 IP")
           PY
 
       - name: Download and extract CloudflareSpeedTest
@@ -124,11 +95,9 @@ jobs:
           # 这里不用 || 兜底，避免用户填 0（不设下限）被当成空值；空值在脚本里回落到 25
           MIN_LATENCY_RAW: ${{ github.event.inputs.min_latency_ms }}
           MAX_LATENCY: ${{ github.event.inputs.max_latency_ms || '350' }}
-          # 每个端口只对延迟最低的前 N 个 IP 做 CF 特征验证
-          VERIFY_TOP: "50"
           # 单个端口 cfst 测速的硬超时（秒），避免一个端口拖死整个 job
           # 注意：cfst 只在全部测完后才写结果文件，被 timeout 杀掉就等于该端口没有任何结果
-          CFST_TIMEOUT: "480"
+          CFST_TIMEOUT: "900"
         run: |
           # 清洗端口字符串，默认 443
           PORTS_CLEAN=$(echo "${PORTS_RAW}" | tr -d '[:space:]')
@@ -139,7 +108,7 @@ jobs:
           [[ "${MIN_LATENCY}" =~ ^[0-9]+$ ]] || MIN_LATENCY="25"
           [[ "${MAX_LATENCY}" =~ ^[0-9]+$ ]] || MAX_LATENCY="350"
 
-          echo "待测网段数: $(wc -l < /tmp/cf_scan/cidrs.txt)（由 cfst 原生抽样，每个 /24 测 1 个 IP）"
+          echo "待测全量 IP 数: $(wc -l < /tmp/cf_scan/all_ips.txt)"
           echo "将要测试的端口列表: ${PORTS_CLEAN} | 延迟范围: ${MIN_LATENCY}ms ~ ${MAX_LATENCY}ms"
           : > /tmp/cf_scan/verified_cf_ips.txt
           : > /tmp/cf_scan/verified_ip_ports.txt
@@ -190,17 +159,19 @@ jobs:
             res_csv="/tmp/cf_scan/verified_${port}.csv"
             rm -f "${out_csv}" "${res_csv}"
 
-            echo "================ 端口 ${port} 延迟测速中 ================"
-            # -f   : 直接传 CIDR 文件，由 cfst 原生抽样（每个 /24 随机 1 个 IP），不要传展开后的巨量 IP
-            # -tl  : 平均延迟上限；-tll: 平均延迟下限（不加的话 cfst 默认是 0，日志里会显示 0 ~ 350 ms）
-            # -dd  : 禁用下载测速，仅做延迟与丢包测速
-            # -n   : 延迟测速并发数（默认 250，最大 1000）
+            echo "================ 端口 ${port} 全量延迟测速中 ================"
+            # -f     : 传入全量展开后的 IP 文件
+            # -allip : 测速全部 IP（确保不做任何内部抽样）
+            # -tl    : 平均延迟上限；-tll: 平均延迟下限
+            # -dd    : 禁用下载测速，仅做延迟与丢包测速
+            # -n     : 延迟测速并发数（最大 1000）
             rc=0
             start_ts=${SECONDS}
             (
               cd /tmp/cf_scan/cfst_linux_amd64
               timeout "${CFST_TIMEOUT}" ./cfst \
-                -f /tmp/cf_scan/cidrs.txt \
+                -f /tmp/cf_scan/all_ips.txt \
+                -allip \
                 -tp "${port}" \
                 -tl "${MAX_LATENCY}" \
                 -tll "${MIN_LATENCY}" \
@@ -211,7 +182,7 @@ jobs:
             elapsed=$(( SECONDS - start_ts ))
 
             if [ "${rc}" = "124" ]; then
-              echo "::warning::端口 ${port}：cfst 跑满 ${CFST_TIMEOUT}s 被 timeout 强制终止（用时 ${elapsed}s）。cfst 只在测完后才写结果，所以该端口没有任何输出；请调小 max_candidates 或减少端口数。"
+              echo "::warning::端口 ${port}：cfst 跑满 ${CFST_TIMEOUT}s 被 timeout 强制终止（用时 ${elapsed}s）。cfst 只在测完后才写结果，所以该端口没有任何输出；请减少网段数量或调大 CFST_TIMEOUT。"
             elif [ "${rc}" != "0" ]; then
               echo "::warning::端口 ${port}：cfst 自身返回非零退出码 ${rc}（用时 ${elapsed}s），不是 timeout 导致。"
             else
@@ -224,8 +195,7 @@ jobs:
             fi
 
             # CSV 第一行是中文表头（用 NR>1 跳过）；列：1=IP 2=已发送 3=已接收 4=丢包率 5=平均延迟(ms)
-            # 只有同时满足「已接收>0」「延迟>0」「MIN_LATENCY <= 延迟 <= MAX_LATENCY」的 IP:端口 才会进入 CF 验证；
-            # cfst 已按 -tll/-tl 过滤过一次，这里再兜底一次。cfst 结果已按延迟升序。
+            # 只有同时满足「已接收>0」「延迟>0」「MIN_LATENCY <= 延迟 <= MAX_LATENCY」的 IP:端口 才会进入 CF 验证
             elig="/tmp/cf_scan/eligible_${port}.txt"
             awk -F',' -v p="${port}" -v min="${MIN_LATENCY}" -v max="${MAX_LATENCY}" '
               NR > 1 && NF >= 5 && $1 != "" && ($3 + 0) > 0 && ($5 + 0) > 0 &&
@@ -234,10 +204,9 @@ jobs:
 
             total_rows=$(( $(wc -l < "${out_csv}") - 1 ))
             elig_rows=$(wc -l < "${elig}")
-            echo "端口 ${port}：cfst 返回 ${total_rows} 条；其中不满足延迟范围 ${MIN_LATENCY}~${MAX_LATENCY}ms 的 $(( total_rows - elig_rows )) 条不做 CF 验证；待验证 ${elig_rows} 条，取延迟最低的前 ${VERIFY_TOP} 条"
+            echo "端口 ${port}：cfst 返回 ${total_rows} 条；其中不满足延迟范围 ${MIN_LATENCY}~${MAX_LATENCY}ms 的 $(( total_rows - elig_rows )) 条不做 CF 验证；待验证 ${elig_rows} 条（全部进入验证）"
 
-            head -n "${VERIFY_TOP}" "${elig}" \
-              | xargs -P 10 -L 1 bash /tmp/cf_scan/verify.sh > "${res_csv}" || true
+            xargs -P 15 -L 1 bash /tmp/cf_scan/verify.sh < "${elig}" > "${res_csv}" || true
 
             if [ -s "${res_csv}" ]; then
               cat "${res_csv}" >> /tmp/cf_scan/verified_details.csv
