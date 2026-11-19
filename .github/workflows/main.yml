@@ -48,15 +48,16 @@ jobs:
 
       - name: Download and extract CloudflareSpeedTest
         run: |
+          mkdir -p /tmp/cfst
           curl -fsSL -o /tmp/cfst/cfst.tar.gz \
             "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_amd64.tar.gz"
           tar -zxf /tmp/cfst/cfst.tar.gz -C /tmp/cfst
-          ls -la /tmp/cfst
-          chmod +x /tmp/cfst/CloudflareST
+          ls -la /tmp/cfst /tmp/cfst/cfst_linux_amd64
+          chmod +x /tmp/cfst/cfst_linux_amd64/CloudflareST
 
       - name: Run download speedtest against custom targets
         run: |
-          cd /tmp/cfst
+          cd /tmp/cfst/cfst_linux_amd64
           # -f targets.txt: 使用 来源.txt 整理出的自定义 IP/端口列表
           # -tp: 指定测速端口（当目标含端口时优先按目标端口连接；若全为同端口也可显式指定）
           # -tl 400: 延迟上限 400ms
