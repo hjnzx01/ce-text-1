@@ -51,7 +51,8 @@ jobs:
           curl -fsSL -o /tmp/cfst/cfst.tar.gz \
             "https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/cfst_linux_amd64.tar.gz"
           tar -zxf /tmp/cfst/cfst.tar.gz -C /tmp/cfst
-          chmod +x /tmp/cfst/cfst
+          ls -la /tmp/cfst
+          chmod +x /tmp/cfst/CloudflareST
 
       - name: Run download speedtest against custom targets
         run: |
@@ -64,7 +65,7 @@ jobs:
           # -url: 建议替换为稳定且命中 Cloudflare 的大文件测速地址
           SPEEDTEST_URL="${SPEEDTEST_URL:-https://speed.cloudflare.com/__down?bytes=200000000}"
 
-          ./cfst \
+          ./CloudflareST \
             -f /tmp/cfst/targets.txt \
             -tl 400 \
             -dt 8 \
